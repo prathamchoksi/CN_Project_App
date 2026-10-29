@@ -1,242 +1,104 @@
-# ==============================================================================
-# Complete Kubernetes (K3s) Multi-Document Infrastructure Manifest
-# 2-Tier Resilient Architecture: Backend API + PostgreSQL Database
-# Target Platform: 3-Node Raspberry Pi Cluster (ARM64)
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# 1. SECRET: Database Credentials
-# ------------------------------------------------------------------------------
+# Before applying, label the two Pis:
+#   kubectl label node <db-pi-name>      role=database
+#   kubectl label node <backend-pi-name> role=backend
 apiVersion: v1
 kind: Secret
 metadata:
   name: postgres-secret
-  labels:
-    app.kubernetes.io/name: postgres-db
-    app.kubernetes.io/part-of: rpi-fault-tolerance-lab
 type: Opaque
 stringData:
-  POSTGRES_DB: "appdb"
-  POSTGRES_USER: "postgres_user"
-  POSTGRES_PASSWORD: "rpi_secure_password_123"
-
+  POSTGRES_DB: appdb
+  POSTGRES_USER: postgres_user
+  POSTGRES_PASSWORD: password
 ---
-# ------------------------------------------------------------------------------
-# 2. DATABASE LAYER: PostgreSQL Deployment
-# ------------------------------------------------------------------------------
+# Runs once on first DB start: creates the table and stores "hello world".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init
+data:
+  init.sql: |
+    CREATE TABLE message (id INT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO message (id, value) VALUES (1, 'hello world');
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: postgres-db
-  labels:
-    app: postgres-db
-    tier: database
-    app.kubernetes.io/name: postgres-db
-    app.kubernetes.io/part-of: rpi-fault-tolerance-lab
+  name: database
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: postgres-db
+      app: database
   template:
     metadata:
       labels:
-        app: postgres-db
-        tier: database
+        app: database
     spec:
+      nodeSelector:
+        role: database
       containers:
         - name: postgres
           image: postgres:15-alpine
-          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5432
-              name: postgres
-          env:
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_DB
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_PASSWORD
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
-          resources:
-            requests:
-              cpu: 100m
-              memory: 256Mi
-            limits:
-              cpu: 100m
-              memory: 256Mi
-          livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-          readinessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - exec pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
+          envFrom:
+            - secretRef:
+                name: postgres-secret
           volumeMounts:
-            - name: postgres-storage
-              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
       volumes:
-        - name: postgres-storage
-          emptyDir: {}
-
+        - name: init
+          configMap:
+            name: db-init
 ---
-# ------------------------------------------------------------------------------
-# 3. DATABASE LAYER: PostgreSQL ClusterIP Service
-# ------------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: db-service
-  labels:
-    app: postgres-db
-    tier: database
-    app.kubernetes.io/name: db-service
-    app.kubernetes.io/part-of: rpi-fault-tolerance-lab
 spec:
-  type: ClusterIP
   selector:
-    app: postgres-db
+    app: database
   ports:
-    - name: postgres
-      port: 5432
+    - port: 5432
       targetPort: 5432
-
 ---
-# ------------------------------------------------------------------------------
-# 4. BACKEND LAYER: Python API Deployment
-# ------------------------------------------------------------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: backend-api
-  labels:
-    app: backend-api
-    tier: api
-    app.kubernetes.io/name: backend-api
-    app.kubernetes.io/part-of: rpi-fault-tolerance-lab
+  name: backend
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      app: backend-api
+      app: backend
   template:
     metadata:
       labels:
-        app: backend-api
-        tier: api
+        app: backend
     spec:
-      # Soft Anti-Affinity: Spreads the 2 backend replicas across distinct worker nodes
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchExpressions:
-                    - key: app
-                      operator: In
-                      values:
-                        - backend-api
-                topologyKey: kubernetes.io/hostname
+      nodeSelector:
+        role: backend
       containers:
-        - name: backend-api
-          image: prathamchoksi/backend-api:latest
-          imagePullPolicy: Always
+        - name: backend
+          image: backend-api:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 5000
-              name: http
-          env:
-            - name: DB_HOST
-              value: "db-service"
-            - name: DB_PORT
-              value: "5432"
-            - name: POSTGRES_DB
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_DB
-            - name: POSTGRES_USER
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_USER
-            - name: POSTGRES_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: POSTGRES_PASSWORD
-            # Downward API: Injects Pod Name & Worker Node Name
-            - name: HOSTNAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 100m
-              memory: 128Mi
-          # Kubernetes Liveness Probe: Process health check
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: 5000
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          # Kubernetes Readiness Probe: Dependency health check
-          readinessProbe:
-            httpGet:
-              path: /ready
-              port: 5000
-            initialDelaySeconds: 5
-            periodSeconds: 3
-            failureThreshold: 2
+          envFrom:
+            - secretRef:
+                name: postgres-secret
 ---
-# ------------------------------------------------------------------------------
-# 5. BACKEND LAYER: External LoadBalancer Service (K3s Klipper ServiceLB)
-# ------------------------------------------------------------------------------
 apiVersion: v1
 kind: Service
 metadata:
   name: backend-service
-  labels:
-    app: backend-api
-    tier: api
-    app.kubernetes.io/name: backend-service
-    app.kubernetes.io/part-of: rpi-fault-tolerance-lab
 spec:
-  type: LoadBalancer
+  type: NodePort
   selector:
-    app: backend-api
+    app: backend
   ports:
-    - name: http
-      port: 8080
+    - port: 5000
       targetPort: 5000
-
+      nodePort: 30080
